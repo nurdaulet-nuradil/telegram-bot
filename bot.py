@@ -13,7 +13,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.state import StatesGroup, State
 from openpyxl import Workbook
 
-API_TOKEN = "7733431801:AAGU2McuBMXM1b2NI9BtGbjzgwFkEDB4Ckg"
+API_TOKEN = "8096936066:AAFkTLz-jYh6RJtg47L2Dwqcm0v75P9mmgI"
 ADMIN_IDS = [7913314152]  # Админ Telegram ID-лерін осында жазыңыз
 
 # Configure logging
@@ -32,7 +32,7 @@ class Registration(StatesGroup):
     waiting_for_file = State()
     waiting_for_confirmation = State()
 
-# Уақытша файл сақтау
+# Уақытша файл (немесе file_id) сақтау
 TEMP_FILES = {}
 
 # Admin check
@@ -70,17 +70,17 @@ async def get_name(message: Message, state: FSMContext):
 @dp.message(Registration.waiting_for_phone)
 async def get_phone(message: Message, state: FSMContext):
     phone = message.text.strip().replace(" ", "").replace("-", "")
-
+    # 8XXXXXXXXXX форматында тексеру
     if not re.fullmatch(r"8\d{10}", phone):
         await message.answer("📵 Телефон нөмірін 8XXXXXXXXXX форматында жазыңыз. Мысалы: 87015556677")
         return
-
     await state.update_data(phone=phone)
     await message.answer("🧾 Чек суретін немесе PDF файлын жіберіңіз:")
     await state.set_state(Registration.waiting_for_file)
 
 @dp.message(Registration.waiting_for_file)
 async def preview_file(message: Message, state: FSMContext):
+    # Файлды тексереміз: тек PHOTO немесе DOCUMENT (.pdf) қабылданады
     if message.content_type == ContentType.PHOTO:
         file_id = message.photo[-1].file_id
         file_type = "photo"
@@ -104,7 +104,6 @@ async def preview_file(message: Message, state: FSMContext):
     ])
 
     await state.set_state(Registration.waiting_for_confirmation)
-
     if file_type == "photo":
         await message.answer_photo(file_id, caption="🧐 Бұл чек дұрыс па?", reply_markup=keyboard)
     else:
@@ -113,13 +112,12 @@ async def preview_file(message: Message, state: FSMContext):
 @dp.callback_query(F.data.in_(["confirm_yes", "confirm_no"]))
 async def handle_confirmation(callback: CallbackQuery, state: FSMContext):
     user_id = callback.from_user.id
-
     if callback.data == "confirm_no":
         await state.set_state(Registration.waiting_for_file)
         await callback.message.answer("📤 Жаңа чек файлын жібере аласыз.")
         return
 
-    # ✅ Дұрыс деп таңдаған болса:
+    # Егер "Дұрыс" таңдаған болса:
     data = await state.get_data()
     full_name = data['full_name']
     phone = data['phone']
@@ -132,8 +130,8 @@ async def handle_confirmation(callback: CallbackQuery, state: FSMContext):
     count = cursor.fetchone()[0]
     participant_id = f"P{count + 1:03d}"
 
+    # Атын қауіпсіз ету (бос орындар мен арнайы символдар ауыстырылды)
     safe_name = full_name.replace(" ", "_").replace("/", "_").replace("\\", "_")
-    os.makedirs("files", exist_ok=True)
 
     file_id, file_type = TEMP_FILES.get(user_id, (None, None))
     if not file_id:
@@ -141,20 +139,12 @@ async def handle_confirmation(callback: CallbackQuery, state: FSMContext):
         await state.set_state(Registration.waiting_for_file)
         return
 
-    ext = ".jpg" if file_type == "photo" else ".pdf"
-    file_name = f"files/{participant_id}_{safe_name}{ext}"
-
-    file = await bot.get_file(file_id)
-    downloaded = await bot.download_file(file.file_path)
-
-    with open(file_name, "wb") as f:
-        f.write(downloaded.read())
-
+    # Файлды локалға жүктемей-ақ, file_id-ні базаға сақтаймыз
     cursor.execute("""
         INSERT INTO participants (
             participant_id, user_id, username, full_name, phone, file_path, file_type, ticket_number
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    """, (participant_id, user_id, username, full_name, phone, file_name, file_type, ticket_number))
+    """, (participant_id, user_id, username, full_name, phone, file_id, file_type, ticket_number))
     conn.commit()
     conn.close()
 
@@ -162,8 +152,106 @@ async def handle_confirmation(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     TEMP_FILES.pop(user_id, None)
 
-# Қалған командалар (list, export, edit) бұрынғыдай жұмыс істейді...
-# (қаласаңыз, оларды да жаңартып толық көшіріп бере аламын)
+@dp.message(F.text == "/list")
+async def list_participants(message: Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("Қол жеткізу шектеулі.")
+        return
+
+    conn = sqlite3.connect("raffle.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT participant_id, full_name, phone, username, ticket_number, file_path, file_type FROM participants")
+    participants = cursor.fetchall()
+    conn.close()
+
+    if not participants:
+        await message.answer("Қатысушылар табылмады.")
+        return
+
+    for i, (pid, name, phone, username, ticket, file_id, file_type) in enumerate(participants, start=1):
+        caption = (f"#{i} 👤 <b>{name}</b>\n🆔 ID: <b>{pid}</b>\n📞 {phone}\n🔗 @{username}\n🎫 Ұтыс нөмірі: <b>{ticket}</b>")
+        try:
+            if file_type == "photo":
+                await message.answer_photo(file_id, caption=caption)
+            else:
+                await message.answer_document(file_id, caption=caption)
+        except Exception as e:
+            await message.answer(f"{i}. ⚠️ Файл жіберілмеді немесе жүктеу қатесі: {e}")
+
+@dp.message(F.text == "/export")
+async def export_to_excel(message: Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("Бұл команда тек админге арналған.")
+        return
+
+    conn = sqlite3.connect("raffle.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT participant_id, full_name, phone, username, ticket_number FROM participants")
+    rows = cursor.fetchall()
+    conn.close()
+
+    if not rows:
+        await message.answer("Экспорттайтын қатысушылар жоқ.")
+        return
+
+    wb = Workbook()
+    ws = wb.active
+    ws.append(["Қатысушы ID", "Аты-жөні", "Телефон", "Username", "Ұтыс нөмірі"])
+    for row in rows:
+        ws.append(row)
+
+    os.makedirs("exports", exist_ok=True)
+    filepath = "exports/participants.xlsx"
+    wb.save(filepath)
+
+    await message.answer_document(FSInputFile(filepath), caption="📄 Қатысушылар тізімі Excel форматында")
+
+@dp.message(F.text.startswith("/edit"))
+async def edit_participant(message: Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("Бұл команда тек админге арналған.")
+        return
+
+    parts = message.text.split(maxsplit=3)
+    if len(parts) < 3:
+        await message.answer("Қолданылуы:\n– Жаңарту: /edit <participant_id> <field> <new_value>\n– Өшіру: /edit <participant_id> delete")
+        return
+
+    pid = parts[1]
+    action = parts[2]
+
+    conn = sqlite3.connect("raffle.db")
+    cursor = conn.cursor()
+
+    if action == "delete":
+        cursor.execute("SELECT file_path FROM participants WHERE participant_id = ?", (pid,))
+        row = cursor.fetchone()
+        # Егер сіз файлды жойғыңыз келсе, бірақ біз file_id сақтаймыз,
+        # онда біз Telegram-нан қайта алуымыз керек. Бірақ әдетте file_id-де өшіру қажет емес.
+        # Біз тек дерекқор жазбасын өшіреміз:
+        cursor.execute("DELETE FROM participants WHERE participant_id = ?", (pid,))
+        conn.commit()
+        conn.close()
+        await message.answer(f"🗑 Қатысушы ID {pid} деректері өшірілді.")
+        return
+
+    if len(parts) < 4:
+        await message.answer("Жаңарту үшін жаңа мән көрсетіңіз: /edit <participant_id> <field> <new_value>")
+        return
+
+    field = action
+    new_value = parts[3]
+    allowed_fields = ["full_name", "phone", "username"]
+
+    if field not in allowed_fields:
+        await message.answer(f"Тек осы өрістерді өзгертуге болады: {', '.join(allowed_fields)}")
+        return
+
+    cursor.execute(f"UPDATE participants SET {field} = ? WHERE participant_id = ?", (new_value, pid))
+    conn.commit()
+    conn.close()
+
+    await message.answer(f"✅ Қатысушы ID {pid} – {field} жаңартылды.")
 
 async def main():
     init_db()
