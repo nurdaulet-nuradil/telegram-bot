@@ -67,15 +67,125 @@ async def start_registration(message: Message, state: FSMContext):
     await message.answer("Аты-жөніңізді енгізіңіз:")
     await state.set_state(Registration.waiting_for_name)
 
+@dp.message(Registration.waiting_for_name)
+async def get_name(message: Message, state: FSMContext):
+    await state.update_data(full_name=message.text)
+    await message.answer("📞 Телефон нөміріңізді енгізіңіз:")
+    await state.set_state(Registration.waiting_for_phone)
+
+@dp.message(Registration.waiting_for_phone)
+async def get_phone(message: Message, state: FSMContext):
+    phone = message.text.strip().replace(" ", "").replace("-", "")
+    if not re.fullmatch(r"8\d{10}", phone):
+        await message.answer("📵 Телефон нөмірін 8XXXXXXXXXX форматында жазыңыз. Мысалы: 87015556677")
+        return
+    await state.update_data(phone=phone)
+    await message.answer("🧾 Чек суретін немесе PDF файлын жіберіңіз:")
+    await state.set_state(Registration.waiting_for_file)
+
+@dp.message(Registration.waiting_for_file)
+async def get_file(message: Message, state: FSMContext):
+    if message.content_type == ContentType.PHOTO:
+        file_id = message.photo[-1].file_id
+        file_type = "photo"
+    elif message.content_type == ContentType.DOCUMENT:
+        if not message.document.file_name.lower().endswith(".pdf"):
+            await message.answer("❌ Қате! Тек .jpg (сурет) және .pdf файлдар ғана қабылданады.")
+            return
+        file_id = message.document.file_id
+        file_type = "pdf"
+    else:
+        await message.answer("❌ Қате! Тек .jpg (сурет) және .pdf файлдар ғана қабылданады.")
+        return
+
+    TEMP_FILES[message.from_user.id] = (file_id, file_type)
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Иә, дұрыс", callback_data="confirm_yes"),
+            InlineKeyboardButton(text="❌ Қайта жіберем", callback_data="confirm_no")
+        ]
+    ])
+
+    await state.set_state(Registration.waiting_for_confirmation)
+    if file_type == "photo":
+        await message.answer_photo(file_id, caption="📷 Бұл чек дұрыс па?", reply_markup=keyboard)
+    else:
+        await message.answer_document(file_id, caption="📄 Бұл чек дұрыс па?", reply_markup=keyboard)
+
+@dp.callback_query(F.data.in_(["confirm_yes", "confirm_no"]))
+async def confirm_file(callback: CallbackQuery, state: FSMContext):
+    if callback.data == "confirm_no":
+        await callback.message.answer("📤 Жаңа файл жіберіңіз:")
+        await state.set_state(Registration.waiting_for_file)
+        return
+
+    user_id = callback.from_user.id
+    data = await state.get_data()
+    full_name = data['full_name']
+    phone = data['phone']
+    username = callback.from_user.username or "жоқ"
+    ticket_number = f"ALM{random.randint(1000, 9999)}"
+
+    conn = sqlite3.connect("raffle.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT COUNT(*) FROM participants")
+    count = cursor.fetchone()[0]
+    participant_id = f"P{count + 1:03d}"
+
+    file_id, file_type = TEMP_FILES.get(user_id, (None, None))
+
+    cursor.execute("""
+        INSERT INTO participants (
+            participant_id, user_id, username, full_name, phone, file_path, file_type, ticket_number
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    """, (participant_id, user_id, username, full_name, phone, file_id, file_type, ticket_number))
+    conn.commit()
+    conn.close()
+
+    await callback.message.answer(f"✅ Сіз тіркелдіңіз!\n👤 Қатысушы ID: <b>{participant_id}</b>\n🎫 Ұтыс нөміріңіз: <b>{ticket_number}</b>")
+    await state.clear()
+
 @dp.callback_query(F.data == "admin_list")
 async def admin_list_callback(callback: CallbackQuery):
-    message = callback.message
-    await list_participants(message)
+    conn = sqlite3.connect("raffle.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT participant_id, full_name, phone, username, ticket_number, file_path, file_type FROM participants")
+    rows = cursor.fetchall()
+    conn.close()
+
+    for i, (pid, name, phone, username, ticket, file_id, file_type) in enumerate(rows, 1):
+        caption = f"#{i} 👤 <b>{name}</b>\n🆔 ID: {pid}\n📞 {phone}\n🔗 @{username}\n🎫 Билет: {ticket}"
+        try:
+            if file_type == "photo":
+                await callback.message.answer_photo(file_id, caption=caption)
+            else:
+                await callback.message.answer_document(file_id, caption=caption)
+        except Exception:
+            await callback.message.answer(caption + "\n⚠️ Файл жіберілмеді")
 
 @dp.callback_query(F.data == "admin_export")
 async def admin_export_callback(callback: CallbackQuery):
-    message = callback.message
-    await export_to_excel(message)
+    conn = sqlite3.connect("raffle.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT participant_id, full_name, phone, username, ticket_number FROM participants")
+    rows = cursor.fetchall()
+    conn.close()
+
+    if not rows:
+        await callback.message.answer("Экспорттайтын қатысушы жоқ.")
+        return
+
+    wb = Workbook()
+    ws = wb.active
+    ws.append(["ID", "Аты-жөні", "Телефон", "Username", "Билет"])
+    for row in rows:
+        ws.append(row)
+
+    os.makedirs("exports", exist_ok=True)
+    filepath = "exports/participants.xlsx"
+    wb.save(filepath)
+
+    await callback.message.answer_document(FSInputFile(filepath), caption="📄 Экспорт файл дайын")
 
 @dp.callback_query(F.data == "admin_stats")
 async def admin_stats_callback(callback: CallbackQuery):
@@ -90,7 +200,7 @@ async def admin_stats_callback(callback: CallbackQuery):
 async def admin_draw_callback(callback: CallbackQuery):
     conn = sqlite3.connect("raffle.db")
     cursor = conn.cursor()
-    cursor.execute("SELECT participant_id, full_name, ticket_number FROM participants")
+    cursor.execute("SELECT participant_id, full_name, ticket_number, phone, username, file_path, file_type FROM participants")
     participants = cursor.fetchall()
     conn.close()
 
@@ -99,11 +209,58 @@ async def admin_draw_callback(callback: CallbackQuery):
         return
 
     winner = random.choice(participants)
-    pid, name, ticket = winner
-    text = f"🎉 <b>Ұтыс жеңімпазы:</b>\n\n👤 <b>{name}</b>\n🆔 ID: {pid}\n🎫 Билет: {ticket}"
-    await callback.message.answer(text)
+    pid, name, ticket, phone, username, file_id, file_type = winner
+    caption = f"🎉 <b>Ұтыс жеңімпазы:</b>\n\n👤 <b>{name}</b>\n🆔 ID: {pid}\n📞 {phone}\n🔗 @{username}\n🎫 Билет: {ticket}"
 
-# ... қалған код (registration, get_file, preview_file, т.б.) бұрынғыдай жалғасады ...
+    if file_type == "photo":
+        await callback.message.answer_photo(file_id, caption=caption)
+    else:
+        await callback.message.answer_document(file_id, caption=caption)
+
+@dp.message(F.text == "/admin")
+async def admin_panel(message: Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("Қол жеткізу шектеулі.")
+        return
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📋 Қатысушылар", callback_data="admin_list")],
+        [InlineKeyboardButton(text="📤 Excel экспорт", callback_data="admin_export")],
+        [InlineKeyboardButton(text="📊 Статистика", callback_data="admin_stats")],
+        [InlineKeyboardButton(text="🎁 Ұтысты бастау", callback_data="admin_draw")]
+    ])
+    await message.answer("Админ панелі:", reply_markup=keyboard)
+
+@dp.message(F.text.startswith("/delete"))
+async def delete_selected_participants(message: Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("Қол жеткізу шектеулі.")
+        return
+
+    parts = message.text.split()
+    if len(parts) < 2:
+        await message.answer("Қолданылуы: /delete P001 P002 ...")
+        return
+
+    ids_to_delete = parts[1:]
+    conn = sqlite3.connect("raffle.db")
+    cursor = conn.cursor()
+
+    deleted = []
+    for pid in ids_to_delete:
+        cursor.execute("SELECT file_path FROM participants WHERE participant_id = ?", (pid,))
+        row = cursor.fetchone()
+        if row:
+            deleted.append(pid)
+            cursor.execute("DELETE FROM participants WHERE participant_id = ?", (pid,))
+
+    conn.commit()
+    conn.close()
+
+    if deleted:
+        await message.answer(f"🗑 Өшірілген қатысушылар: {', '.join(deleted)}")
+    else:
+        await message.answer("Тиісті ID табылмады немесе қате енгізілді.")
+
 
 async def main():
     init_db()
