@@ -13,8 +13,8 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.state import StatesGroup, State
 from openpyxl import Workbook
 
-API_TOKEN = "8096936066:AAFkTLz-jYh6RJtg47L2Dwqcm0v75P9mmgI"
-ADMIN_IDS = [7913314152]  # Админ Telegram ID-лерін осында жазыңыз
+API_TOKEN = os.getenv("API_TOKEN")
+ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()]
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -264,6 +264,7 @@ async def delete_selected_participants(message: Message):
 
 async def main():
     init_db()
+    await bot.delete_webhook(drop_pending_updates=True)  # ✅ Қорғау
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
